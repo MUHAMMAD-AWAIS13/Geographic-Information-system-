@@ -1,0 +1,711 @@
+var CONFIG = {
+  driveFolder: 'Faisalabad_Atlas',
+  crs: 'EPSG:32643',              // UTM zone 43N, metres, for exported analysis layers
+
+  censusYear: 2023,               // WorldPop R2025A year used to distribute the census counts
+  smodYear: 2020,                 // GHS-SMOD epoch. 2020 is the latest non-projected epoch
+  builtYear: 2020,                // GHS-BUILT-S epoch. Same reason
+
+  builtMinFraction: 0.10,         // a 100 m cell counts as built-up at 10% built surface or more
+  settlementMinHa: 5,             // smaller built-up patches are dropped
+  settlementBreaks: [2000, 10000, 50000],  // analytical size classes, not legal status
+
+  areaReviewPct: 10,              // GIS vs census area difference above this is marked REVIEW
+  constrainTolPct: 1,             // fitted grid must match the census within this per tehsil
+  tileScale: 4,                   // raise to 8 or 16 if a computation runs out of memory
+
+  // Optional: official tehsil polygons. Names must match tehsilCensus exactly.
+  tehsilAsset: '',
+  tehsilNameField: '',
+
+  // Optional: Union Council polygons.
+  // Example: 'projects/your-project/assets/faisalabad_uc'
+  ucAsset: '',
+  ucNameField: '',
+  ucCodeField: '',
+
+  // Optional: UC census table, joined to the polygons on the code field.
+  ucCensusAsset: '',
+  ucCensusCodeField: '',
+  ucCensusPopField: '',
+
+  // Optional: named settlement points.
+  settlementAsset: '',
+  settlementNameField: ''
+};
+
+// Official district totals, used only as controls.
+var OFFICIAL = {
+  population: 9075819,
+  urban: 4392979,
+  rural: 4682840,
+  areaKm2: 5857
+};
+
+var TEHSIL_COUNT = 6;
+
+// Colour-vision-safe palettes.
+var PAL = {
+  tehsilDensity: ['ffffcc', 'a1dab4', '41b6c4', '225ea8'],
+  grid: ['f7fcf0', 'ccebc5', '7bccc4', '2b8cbe', '084081'],
+  urbanCentre: 'D55E00',
+  urbanCluster: 'E69F00',
+  rural: '009E73',
+  water: '56B4E9',
+  built: '000000',
+  metro: 'CC79A7',
+  uc: '6a3d9a'
+};
+
+var DENSITY_BREAKS = [750, 1000, 2000];
+var DENSITY_LABELS = ['Below 750', '750 to 1,000', '1,000 to 2,000', 'Above 2,000'];
+
+// ----------------------------- BOUNDARIES ------------------------------
+var census = tehsilCensus();
+var censusLookup = {};
+census.forEach(function (row) { censusLookup[row.tehsil] = row; });
+var tehsilNames = census.map(function (row) { return row.tehsil; });
+
+var tehsilGeoms;
+if (CONFIG.tehsilAsset) {
+  tehsilGeoms = ee.FeatureCollection(CONFIG.tehsilAsset)
+    .filter(ee.Filter.inList(CONFIG.tehsilNameField, tehsilNames))
+    .map(function (f) {
+      return ee.Feature(f.geometry(), {tehsil: f.get(CONFIG.tehsilNameField)});
+    });
+} else {
+  var embedded = tehsilGeometry();
+  tehsilGeoms = ee.FeatureCollection(tehsilNames.map(function (name) {
+    return ee.Feature(ee.Geometry.Polygon(embedded[name], 'EPSG:4326', false), {tehsil: name});
+  }));
+}
+
+var censusDict = ee.Dictionary(censusLookup);
+
+var tehsilBase = tehsilGeoms.map(function (f) {
+  var row = ee.Dictionary(censusDict.get(f.get('tehsil')));
+  var gisKm2 = f.geometry().area(1).divide(1e6);
+  var pop = ee.Number(row.get('pop2023'));
+  var censusKm2 = ee.Number(row.get('census_area_km2'));
+  return f.set(row).set({
+    gis_area_km2: gisKm2,
+    area_diff_pct: gisKm2.subtract(censusKm2).divide(censusKm2).multiply(100),
+    density_census: pop.divide(censusKm2),
+    density_gis: pop.divide(gisKm2)
+  });
+});
+
+var districtGeom = tehsilGeoms.union(1).geometry();
+var districtFc = ee.FeatureCollection([ee.Feature(districtGeom, {
+  district: 'Faisalabad',
+  pop2023: OFFICIAL.population,
+  pop2023_urban: OFFICIAL.urban,
+  pop2023_rural: OFFICIAL.rural,
+  census_area_km2: OFFICIAL.areaKm2,
+  gis_area_km2: districtGeom.area(1).divide(1e6),
+  density_census: OFFICIAL.population / OFFICIAL.areaKm2
+})]);
+
+// ------------------------------ POPULATION -----------------------------
+var wpCollection = ee.ImageCollection('WorldPop/GP/100m/R2025A/v1/pop')
+  .filter(ee.Filter.eq('year', CONFIG.censusYear))
+  .filter(ee.Filter.eq('country', 'PAK'));
+var worldpop = ee.Image(wpCollection.first()).select('population');
+
+// Counts must be summed on the native grid. Any other grid would change the totals.
+var popProj = worldpop.projection();
+var popScale = popProj.nominalScale();
+
+function sumOnPopGrid(image, collection) {
+  return image.reduceRegions({
+    collection: collection,
+    reducer: ee.Reducer.sum(),
+    crs: popProj,
+    scale: popScale,
+    tileScale: CONFIG.tileScale
+  });
+}
+
+// Scale each tehsil's modelled pixels so they sum to its census count.
+var tehsilFit = sumOnPopGrid(worldpop, tehsilBase).map(function (f) {
+  var modelled = ee.Number(f.get('sum'));
+  return f.set({
+    pop_worldpop: modelled,
+    fit_factor: ee.Number(f.get('pop2023')).divide(modelled)
+  });
+});
+
+var fitFactor = tehsilFit.reduceToImage(['fit_factor'], ee.Reducer.first()).rename('fit_factor');
+var popFitted = worldpop.multiply(fitFactor).rename('pop_fitted').setDefaultProjection(popProj);
+// Fixed to the native grid: otherwise, when zoomed out, mean counts get divided by a large pixel's area.
+var pixelKm2 = ee.Image.pixelArea().divide(1e6).reproject(popProj);
+var popDensity = popFitted.divide(pixelKm2).rename('pop_per_km2');
+
+// --------------------------- URBAN/RURAL CLASSES -----------------------
+var smod = ee.Image('JRC/GHSL/P2023A/GHS_SMOD_V2-0/' + CONFIG.smodYear).select('smod_code');
+// 1 urban centre, 2 urban cluster, 3 rural, 4 water
+var urbanClass = smod.remap([30, 23, 22, 21, 13, 12, 11, 10], [1, 2, 2, 2, 3, 3, 3, 4])
+  .rename('urban_class');
+
+var classImage = ee.Image.cat([
+  popFitted.rename('pop_fit_total'),
+  popFitted.updateMask(urbanClass.eq(1)).rename('pop_urban_centre'),
+  popFitted.updateMask(urbanClass.eq(2)).rename('pop_urban_cluster'),
+  popFitted.updateMask(urbanClass.eq(3)).rename('pop_rural'),
+  pixelKm2.updateMask(urbanClass.eq(1)).rename('km2_urban_centre'),
+  pixelKm2.updateMask(urbanClass.eq(2)).rename('km2_urban_cluster'),
+  pixelKm2.updateMask(urbanClass.eq(3)).rename('km2_rural')
+]);
+
+var tehsilStats = sumOnPopGrid(classImage, tehsilFit).map(function (f) {
+  var total = ee.Number(f.get('pop_fit_total'));
+  var urban = ee.Number(f.get('pop_urban_centre')).add(f.get('pop_urban_cluster'));
+  return f.set({
+    pop_urban_model: urban,
+    pop_rural_model: f.get('pop_rural'),
+    urban_share_model_pct: urban.divide(total).multiply(100),
+    fit_error_pct: total.subtract(f.get('pop2023')).divide(f.get('pop2023')).multiply(100).abs()
+  });
+});
+
+var densityClass = tehsilStats.reduceToImage(['density_census'], ee.Reducer.first());
+var densityClassImage = densityClass.gte(DENSITY_BREAKS[0])
+  .add(densityClass.gte(DENSITY_BREAKS[1]))
+  .add(densityClass.gte(DENSITY_BREAKS[2]));
+
+// ------------------------- METROPOLITAN EXTENT -------------------------
+// Urban-centre patches touching the Faisalabad City tehsil, cut at the district edge.
+var cityTehsil = tehsilGeoms.filter(ee.Filter.eq('tehsil', 'Faisalabad City'));
+var metroRaw = urbanClass.eq(1).selfMask().reduceToVectors({
+  geometry: districtGeom,
+  crs: smod.projection(),
+  scale: 1000,
+  geometryType: 'polygon',
+  eightConnected: true,
+  maxPixels: 1e9,
+  tileScale: CONFIG.tileScale
+}).filterBounds(cityTehsil);
+
+var metro = sumOnPopGrid(popFitted, metroRaw).map(function (f) {
+  return ee.Feature(f.geometry(), {
+    name: 'Faisalabad urban centre (GHS-SMOD ' + CONFIG.smodYear + ')',
+    area_km2: f.geometry().area(100).divide(1e6),
+    pop_fitted: f.get('sum')
+  });
+});
+
+// ------------------------ SETTLEMENTS (BUILT-UP) -----------------------
+var built = ee.Image('JRC/GHSL/P2023A/GHS_BUILT_S/' + CONFIG.builtYear).select('built_surface');
+var builtProj = built.projection();
+var builtMask = built.gte(CONFIG.builtMinFraction * 10000).rename('built');
+
+var patchesRaw = builtMask.selfMask().reduceToVectors({
+  geometry: districtGeom,
+  crs: builtProj,
+  scale: 100,
+  geometryType: 'polygon',
+  eightConnected: true,
+  maxPixels: 1e9,
+  tileScale: CONFIG.tileScale
+}).map(function (f) {
+  return f.set('area_ha', f.geometry().area(10).divide(1e4));
+}).filter(ee.Filter.gte('area_ha', CONFIG.settlementMinHa));
+
+var patchesPop = sumOnPopGrid(popFitted, patchesRaw);
+var patchesClass = urbanClass.reduceRegions({
+  collection: patchesPop,
+  reducer: ee.Reducer.mode(),
+  crs: builtProj,
+  scale: 100,
+  tileScale: CONFIG.tileScale
+});
+
+var b = CONFIG.settlementBreaks;
+function sizeClass(pop) {
+  return ee.Algorithms.If(pop.lt(b[0]), 'Small village, below ' + b[0],
+    ee.Algorithms.If(pop.lt(b[1]), 'Village, ' + b[0] + ' to ' + b[1],
+      ee.Algorithms.If(pop.lt(b[2]), 'Town, ' + b[1] + ' to ' + b[2],
+        'City or conurbation, ' + b[2] + ' and above')));
+}
+
+var urbanNames = ee.Dictionary({'1': 'Urban centre', '2': 'Urban cluster', '3': 'Rural', '4': 'Water'});
+
+var settlements = patchesClass.map(function (f) {
+  var pop = ee.Number(f.get('sum'));
+  var mode = f.get('mode');
+  return ee.Feature(f.geometry(), {
+    settlement_id: f.get('system:index'),
+    area_ha: f.get('area_ha'),
+    pop_fitted: pop,
+    size_class: sizeClass(pop),
+    urban_class: ee.Algorithms.If(mode,
+      urbanNames.get(ee.Number(mode).int().format('%d')), 'Unclassified')
+  });
+});
+
+var settlementPointsRaw = settlements.map(function (f) {
+  return f.setGeometry(f.geometry().centroid(10));
+});
+
+// Points carry the tehsil they fall in. outer:true keeps a point that lands on no tehsil.
+var settlementPoints = ee.Join.saveFirst({matchKey: 'tehsil_match', outer: true})
+  .apply(settlementPointsRaw, tehsilGeoms, ee.Filter.intersects({
+    leftField: '.geo', rightField: '.geo', maxError: 10
+  }))
+  .map(function (f) {
+    var match = f.get('tehsil_match');
+    return ee.Feature(f.geometry(), f.toDictionary(
+      ['settlement_id', 'area_ha', 'pop_fitted', 'size_class', 'urban_class']
+    )).set('tehsil', ee.Algorithms.If(match, ee.Feature(match).get('tehsil'), 'Outside tehsils'));
+  });
+
+var namedSettlements = null;
+if (CONFIG.settlementAsset) {
+  namedSettlements = ee.FeatureCollection(CONFIG.settlementAsset)
+    .filterBounds(districtGeom)
+    .map(function (f) {
+      return ee.Feature(f.geometry(), {name: f.get(CONFIG.settlementNameField)});
+    });
+}
+
+// ---------------------------- UNION COUNCILS ---------------------------
+var ucStats = null;
+var ucCensusMatched = null;
+if (CONFIG.ucAsset) {
+  // A UC belongs to the district if its centroid does. filterBounds alone would admit neighbours.
+  var ucInside = ee.FeatureCollection(CONFIG.ucAsset)
+    .filterBounds(districtGeom)
+    .map(function (f) {
+      return f.set('in_district', districtGeom.contains(f.geometry().centroid(10), 10));
+    })
+    .filter(ee.Filter.eq('in_district', true))
+    .map(function (f) {
+      return ee.Feature(f.geometry(), {
+        uc_name: f.get(CONFIG.ucNameField),
+        uc_code: ee.Algorithms.String(f.get(CONFIG.ucCodeField)),
+        area_km2: f.geometry().area(1).divide(1e6)
+      });
+    });
+
+  var ucJoined = ucInside;
+  if (CONFIG.ucCensusAsset) {
+    var ucCensus = ee.FeatureCollection(CONFIG.ucCensusAsset).map(function (f) {
+      return ee.Feature(null, {
+        uc_code: ee.Algorithms.String(f.get(CONFIG.ucCensusCodeField)),
+        pop2023_census: f.get(CONFIG.ucCensusPopField)
+      });
+    });
+    ucJoined = ee.Join.saveFirst({matchKey: 'census_match', outer: true})
+      .apply(ucInside, ucCensus, ee.Filter.equals({leftField: 'uc_code', rightField: 'uc_code'}))
+      .map(function (f) {
+        var match = f.get('census_match');
+        return ee.Feature(f.geometry(), f.toDictionary(['uc_name', 'uc_code', 'area_km2']))
+          .set('pop2023_census', ee.Algorithms.If(match, ee.Feature(match).get('pop2023_census'), -1));
+      });
+    ucCensusMatched = ucJoined.filter(ee.Filter.gte('pop2023_census', 0)).size();
+  }
+
+  ucStats = sumOnPopGrid(classImage, ucJoined).map(function (f) {
+    var total = ee.Number(f.get('pop_fit_total'));
+    return f.set({
+      density_fitted: total.divide(f.get('area_km2')),
+      urban_share_model_pct: ee.Number(f.get('pop_urban_centre')).add(f.get('pop_urban_cluster'))
+        .divide(total.max(1)).multiply(100)
+    });
+  });
+}
+
+// ------------------------------- CONTROLS ------------------------------
+function control(id, description, observed, expected, status, note) {
+  return ee.Feature(null, {
+    id: id, description: description, observed: observed,
+    expected: expected, status: status, note: note
+  });
+}
+function clientStatus(ok) { return ok ? 'PASS' : 'FAIL'; }
+
+var censusSum = census.reduce(function (s, r) { return s + r.pop2023; }, 0);
+var areaSum = census.reduce(function (s, r) { return s + r.census_area_km2; }, 0);
+var modelledTotal = tehsilFit.aggregate_sum('pop_worldpop');
+var tehsilAreaSum = tehsilBase.aggregate_sum('gis_area_km2');
+var dissolvedArea = districtGeom.area(1).divide(1e6);
+var overlapGapPct = dissolvedArea.subtract(tehsilAreaSum).divide(tehsilAreaSum).multiply(100).abs();
+var maxFitError = ee.Number(tehsilStats.aggregate_max('fit_error_pct'));
+var maxAreaDiff = ee.Number(tehsilBase.map(function (f) {
+  return f.set('abs_diff', ee.Number(f.get('area_diff_pct')).abs());
+}).aggregate_max('abs_diff'));
+var modelUrbanPct = ee.Number(tehsilStats.aggregate_sum('pop_urban_model'))
+  .divide(OFFICIAL.population).multiply(100);
+var officialUrbanPct = OFFICIAL.urban / OFFICIAL.population * 100;
+var adm2 = ee.FeatureCollection('WM/geoLab/geoBoundaries/600/ADM2')
+  .filter(ee.Filter.eq('shapeGroup', 'PAK'))
+  .filter(ee.Filter.eq('shapeName', 'Faisalabad'));
+
+var controlList = [
+  control('C01', 'Six tehsils present', tehsilGeoms.size(), TEHSIL_COUNT,
+    ee.Algorithms.If(tehsilGeoms.size().eq(TEHSIL_COUNT), 'PASS', 'FAIL'),
+    'If FAIL with tehsilAsset set, the asset names do not match tehsilCensus.'),
+  control('C02', 'Tehsil census populations sum to district', censusSum, OFFICIAL.population,
+    clientStatus(censusSum === OFFICIAL.population), 'Embedded values against the district total.'),
+  control('C03', 'Urban plus rural equals district population', OFFICIAL.urban + OFFICIAL.rural,
+    OFFICIAL.population, clientStatus(OFFICIAL.urban + OFFICIAL.rural === OFFICIAL.population),
+    'Official district split.'),
+  control('C04', 'Census tehsil areas sum to district area', areaSum, OFFICIAL.areaKm2,
+    clientStatus(areaSum === OFFICIAL.areaKm2), 'Embedded values against the district total.'),
+  control('C05', 'WorldPop image found for Pakistan and census year', wpCollection.size(), 1,
+    ee.Algorithms.If(wpCollection.size().eq(1), 'PASS', 'FAIL'), 'Everything downstream needs this.'),
+  control('C06', 'Tehsil polygons do not overlap or leave gaps (percent)', overlapGapPct, '0 to 0.5',
+    ee.Algorithms.If(overlapGapPct.lte(0.5), 'PASS', 'REVIEW'),
+    'Dissolved area against the sum of tehsil areas.'),
+  control('C07', 'Fitted grid matches census per tehsil, worst case (percent)', maxFitError,
+    'at most ' + CONFIG.constrainTolPct,
+    ee.Algorithms.If(maxFitError.lte(CONFIG.constrainTolPct), 'PASS', 'FAIL'),
+    'Small differences come from pixels split at tehsil edges.'),
+  control('C08', 'Worst tehsil GIS area against census area (percent)', maxAreaDiff,
+    'at most ' + CONFIG.areaReviewPct,
+    ee.Algorithms.If(maxAreaDiff.lte(CONFIG.areaReviewPct), 'PASS', 'REVIEW'),
+    'REVIEW is expected with the embedded polygons. Official boundaries would resolve it.'),
+  control('C09', 'District GIS area (km2)', dissolvedArea, OFFICIAL.areaKm2, 'INFO',
+    'Dissolved tehsils against the census area.'),
+  control('C10', 'geoBoundaries ADM2 district area (km2)',
+    ee.Algorithms.If(adm2.size().eq(1), adm2.geometry().area(100).divide(1e6), -1),
+    OFFICIAL.areaKm2, 'INFO', 'Independent boundary source, for comparison only.'),
+  control('C11', 'WorldPop district total before fitting', modelledTotal, OFFICIAL.population, 'INFO',
+    'Shows how far the unfitted model is from the census.'),
+  control('C12', 'Urban share, GHS-SMOD on fitted grid (percent)', modelUrbanPct, officialUrbanPct, 'INFO',
+    'Morphological against the census administrative definition. They need not agree.')
+];
+if (ucStats) {
+  controlList.push(control('C13', 'Union Councils inside district', ucStats.size(), 'your official count',
+    'INFO', 'Compare with the official count for the delimitation you uploaded.'));
+}
+if (ucCensusMatched) {
+  controlList.push(control('C14', 'UC polygons matched to a census row', ucCensusMatched, ucStats.size(),
+    ee.Algorithms.If(ucCensusMatched.eq(ucStats.size()), 'PASS', 'FAIL'),
+    'Unmatched UCs carry pop2023_census = -1.'));
+}
+var controls = ee.FeatureCollection(controlList);
+
+print('CONTROL TABLE: read this first');
+print(controls.map(function (f) {
+  return ee.Feature(null, {
+    row: ee.String(f.get('id')).cat(' ').cat(f.get('status')).cat(': ').cat(f.get('description'))
+      .cat(' | observed ').cat(ee.Algorithms.String(f.get('observed')))
+      .cat(' | expected ').cat(ee.Algorithms.String(f.get('expected')))
+  });
+}).aggregate_array('row'));
+
+print('Tehsil statistics', tehsilStats.select([
+  'tehsil', 'pop2023', 'census_area_km2', 'gis_area_km2', 'area_diff_pct', 'density_census',
+  'density_gis', 'growth_pct_yr', 'pop_worldpop', 'fit_factor', 'urban_share_model_pct'
+], null, false));
+print('Metropolitan extent', metro);
+print('Built-up settlement patches', settlements.size());
+
+// ---------------------------------- MAP --------------------------------
+var LIGHT_STYLE = [
+  {stylers: [{saturation: -100}, {lightness: 35}]},
+  {featureType: 'poi', stylers: [{visibility: 'off'}]},
+  {featureType: 'transit', stylers: [{visibility: 'off'}]}
+];
+Map.setOptions('Atlas', {Atlas: LIGHT_STYLE});
+Map.centerObject(districtGeom, 9);
+Map.style().set('cursor', 'crosshair');
+
+Map.addLayer(densityClassImage, {min: 0, max: 3, palette: PAL.tehsilDensity},
+  'Tehsil density, census (people per km2)', false);
+Map.addLayer(popDensity.add(1).log10().updateMask(popDensity.gt(0)),
+  {min: 1, max: 4.5, palette: PAL.grid}, 'Population density, census-fitted grid');
+Map.addLayer(urbanClass.clip(districtGeom),
+  {min: 1, max: 4, palette: [PAL.urbanCentre, PAL.urbanCluster, PAL.rural, PAL.water]},
+  'Urban/rural, GHS-SMOD ' + CONFIG.smodYear, false);
+Map.addLayer(settlements.style({color: PAL.built, width: 1, fillColor: '00000055'}), {},
+  'Built-up settlement patches', false);
+Map.addLayer(settlementPointsRaw.style({color: PAL.built, pointSize: 2, width: 0, fillColor: PAL.built}), {},
+  'Settlement centroids', false);
+Map.addLayer(metro.style({color: PAL.metro, width: 3, fillColor: '00000000'}), {},
+  'Metropolitan extent (urban centre)', false);
+if (ucStats) {
+  Map.addLayer(ucStats.style({color: PAL.uc, width: 1, fillColor: '00000000'}), {}, 'Union Councils');
+}
+if (namedSettlements) {
+  Map.addLayer(namedSettlements.style({color: 'e31a1c', pointSize: 3, width: 1}), {}, 'Named settlements');
+}
+Map.addLayer(tehsilGeoms.style({color: '333333', width: 1.5, fillColor: '00000000'}), {}, 'Tehsil boundaries');
+Map.addLayer(ee.FeatureCollection([ee.Feature(districtGeom)]).style({color: '000000', width: 3, fillColor: '00000000'}),
+  {}, 'District boundary');
+
+// --------------------------------- PANEL -------------------------------
+// Remove any panel left by an earlier run, so that only one is ever shown.
+ui.root.widgets().getJsArray().slice().forEach(function (widget) {
+  if (widget instanceof ui.Panel) { ui.root.remove(widget); }
+});
+var panel = ui.Panel({style: {width: '380px', padding: '10px'}});
+ui.root.insert(0, panel);
+
+function heading(text) {
+  return ui.Label(text, {fontWeight: 'bold', fontSize: '14px', margin: '12px 0 4px 0'});
+}
+function body(text) {
+  return ui.Label(text, {fontSize: '12px', margin: '2px 0', color: '444444'});
+}
+function legendRow(color, label) {
+  return ui.Panel([
+    ui.Label('', {backgroundColor: '#' + color, padding: '8px', margin: '2px 6px 2px 0',
+      border: '1px solid #999999'}),
+    ui.Label(label, {fontSize: '12px', margin: '4px 0'})
+  ], ui.Panel.Layout.flow('horizontal'));
+}
+
+panel.add(ui.Label('Faisalabad GIS Atlas', {fontWeight: 'bold', fontSize: '18px', margin: '0 0 2px 0'}));
+panel.add(body('Component 01: Administrative GIS Mapping'));
+panel.add(body('District population 2023: ' + OFFICIAL.population.toLocaleString() +
+  ', six tehsils, ' + OFFICIAL.areaKm2.toLocaleString() + ' km2.'));
+
+panel.add(heading('Click the map'));
+var inspector = ui.Panel();
+inspector.add(body('Click inside the district to read tehsil values.'));
+panel.add(inspector);
+
+panel.add(heading('Union Councils'));
+panel.add(body(CONFIG.ucAsset
+  ? 'Loaded from your asset. Population below is from the fitted grid unless a census table is joined.'
+  : 'Not loaded. No official UC boundary exists in Earth Engine. Set ucAsset in CONFIG.'));
+
+panel.add(heading('Tehsil density (people per km2, census area)'));
+PAL.tehsilDensity.forEach(function (color, i) { panel.add(legendRow(color, DENSITY_LABELS[i])); });
+
+panel.add(heading('Population density, census-fitted grid'));
+panel.add(ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: {bbox: [0, 0, 1, 0.1], dimensions: '320x14', format: 'png', min: 0, max: 1, palette: PAL.grid},
+  style: {stretch: 'horizontal', margin: '2px 0', maxHeight: '18px'}
+}));
+panel.add(body('Log scale, left to right: 10, 100, 1,000, 10,000 and about 30,000 people per km2.'));
+
+panel.add(heading('Urban/rural, modelled (GHS-SMOD)'));
+panel.add(legendRow(PAL.urbanCentre, 'Urban centre'));
+panel.add(legendRow(PAL.urbanCluster, 'Urban cluster'));
+panel.add(legendRow(PAL.rural, 'Rural'));
+panel.add(legendRow(PAL.water, 'Water'));
+
+function barChart(title, props, axis, stacked, colors) {
+  return ui.Chart.feature.byFeature(tehsilStats.sort('pop2023', false), 'tehsil', props)
+    .setChartType('BarChart')
+    .setOptions({
+      title: title,
+      hAxis: {title: axis, minValue: 0},
+      vAxis: {textStyle: {fontSize: 11}},
+      legend: {position: props.length > 1 ? 'bottom' : 'none'},
+      isStacked: stacked,
+      colors: colors,
+      height: 260
+    });
+}
+
+// PNG map images, prepared only on request because each one costs compute.
+var whiteBackground = ee.Image.constant(1).visualize({min: 0, max: 1, palette: ['ffffff', 'ffffff']});
+var tehsilLines = tehsilGeoms.style({color: '333333', width: 1.5, fillColor: '00000000'});
+var districtLine = ee.FeatureCollection([ee.Feature(districtGeom)])
+  .style({color: '000000', width: 3, fillColor: '00000000'});
+var MAP_IMAGES = [
+  ['Boundaries', null],
+  ['Population density', popDensity.add(1).log10().updateMask(popDensity.gt(0))
+    .visualize({min: 1, max: 4.5, palette: PAL.grid})],
+  ['Tehsil density', densityClassImage.visualize({min: 0, max: 3, palette: PAL.tehsilDensity})],
+  ['Urban and rural', urbanClass.clip(districtGeom).visualize({min: 1, max: 4,
+    palette: [PAL.urbanCentre, PAL.urbanCluster, PAL.rural, PAL.water]})],
+  ['Settlement patches', settlements.style({color: PAL.built, width: 1, fillColor: '00000055'})],
+  ['Metropolitan extent', metro.style({color: PAL.metro, width: 3, fillColor: '00000000'})]
+];
+var mapLinks = ui.Panel();
+function addMapLink(item) {
+  var link = ui.Label('Preparing: ' + item[0] + '...', {fontSize: '12px', margin: '2px 0'});
+  mapLinks.add(link);
+  var picture = item[1] ? whiteBackground.blend(item[1]) : whiteBackground;
+  picture.blend(tehsilLines).blend(districtLine).getThumbURL({
+    region: districtGeom.bounds(), dimensions: 1800, format: 'png', crs: CONFIG.crs
+  }, function (url, error) {
+    if (error) { link.setValue('Could not prepare ' + item[0] + ': ' + error); return; }
+    link.setValue('Open PNG: ' + item[0]);
+    link.setUrl(url);
+  });
+}
+panel.add(heading('Download map images'));
+panel.add(body('The links are temporary. Images have no legend, so use the legends in this panel.'));
+panel.add(ui.Button({
+  label: 'Prepare PNG links',
+  onClick: function () {
+    mapLinks.clear();
+    MAP_IMAGES.forEach(addMapLink);
+  }
+}));
+panel.add(mapLinks);
+
+panel.add(heading('Charts'));
+panel.add(body('Use the arrow at the top right of a chart to download it as CSV, SVG or PNG.'));
+panel.add(barChart('Census population 2023', ['pop2023'], 'People', false, ['2b8cbe']));
+panel.add(barChart('Census density 2023', ['density_census'], 'People per km2', false, ['225ea8']));
+panel.add(barChart('Average annual growth 2017 to 2023', ['growth_pct_yr'], 'Percent per year', false, ['41b6c4']));
+panel.add(barChart('Area: census against GIS polygon', ['census_area_km2', 'gis_area_km2'], 'km2', false,
+  ['888888', 'E69F00']));
+panel.add(barChart('Modelled urban and rural population',
+  ['pop_urban_model', 'pop_rural_model'], 'People (fitted grid)', true, [PAL.urbanCentre, PAL.rural]));
+
+panel.add(heading('Sources'));
+panel.add(body('Census: PBS 2023, secondary transcription, verify before official use.'));
+panel.add(body('Tehsils: geoBoundaries gbOpen PAK ADM3 (ODbL 1.0), not gazetted.'));
+panel.add(body('Population grid: WorldPop R2025A, fitted to tehsil census counts.'));
+panel.add(body('Urban/rural and built-up: JRC GHSL P2023A.'));
+
+// Click inspector
+function showValues(title, rows) {
+  inspector.add(ui.Label(title, {fontWeight: 'bold', fontSize: '12px', margin: '4px 0 2px 0'}));
+  rows.forEach(function (r) { inspector.add(body(r)); });
+}
+function fmt(value, digits) {
+  if (value === null || value === undefined) { return 'n/a'; }
+  return Number(value).toLocaleString(undefined, {maximumFractionDigits: digits});
+}
+var latestClick = 0;
+Map.unlisten();
+Map.onClick(function (coords) {
+  var point = ee.Geometry.Point(coords.lon, coords.lat);
+  latestClick += 1;
+  var thisClick = latestClick;
+  inspector.clear();
+  inspector.add(body('Loading...'));
+  tehsilStats.filterBounds(point).limit(1).evaluate(function (fc, error) {
+    // A newer click replaces this one, so its late results are ignored.
+    if (thisClick !== latestClick) { return; }
+    inspector.clear();
+    if (error) { inspector.add(body('Could not read values: ' + error)); return; }
+    if (!fc.features.length) { inspector.add(body('Outside the district.')); return; }
+    var t = fc.features[0].properties;
+    showValues(t.tehsil + ' tehsil', [
+      'Census population 2023: ' + fmt(t.pop2023, 0),
+      'Census density: ' + fmt(t.density_census, 0) + ' per km2',
+      'Growth 2017 to 2023: ' + fmt(t.growth_pct_yr, 2) + '% per year',
+      'Urban share, modelled: ' + fmt(t.urban_share_model_pct, 1) + '%'
+    ]);
+    popDensity.reduceRegion({
+      reducer: ee.Reducer.first(), geometry: point, crs: popProj, scale: popScale
+    }).evaluate(function (values, densityError) {
+      if (thisClick !== latestClick) { return; }
+      if (densityError) {
+        inspector.add(body('Fitted density could not be read: ' + densityError));
+      } else if (values.pop_per_km2 === null || values.pop_per_km2 === undefined) {
+        inspector.add(body('Fitted density here: no population modelled at this exact pixel.'));
+      } else {
+        inspector.add(body('Fitted density here: ' + fmt(values.pop_per_km2, 0) + ' per km2'));
+      }
+    });
+    if (ucStats) {
+      ucStats.filterBounds(point).limit(1).evaluate(function (ucFc) {
+        if (thisClick !== latestClick || !ucFc || !ucFc.features.length) { return; }
+        var u = ucFc.features[0].properties;
+        showValues('Union Council: ' + u.uc_name, [
+          'Code: ' + u.uc_code,
+          'Area: ' + fmt(u.area_km2, 2) + ' km2',
+          'Population, fitted grid: ' + fmt(u.pop_fit_total, 0),
+          'Population, census: ' + (u.pop2023_census === undefined || u.pop2023_census < 0
+            ? 'not supplied' : fmt(u.pop2023_census, 0))
+        ]);
+      });
+    }
+  });
+});
+
+// -------------------------------- EXPORTS ------------------------------
+function exportTable(fc, name, format, selectors) {
+  var params = {collection: fc, description: name, folder: CONFIG.driveFolder,
+    fileNamePrefix: name, fileFormat: format};
+  if (selectors) { params.selectors = selectors; }
+  Export.table.toDrive(params);
+}
+function exportUtm(image, name, scale, noData) {
+  Export.image.toDrive({image: image, description: name, folder: CONFIG.driveFolder,
+    fileNamePrefix: name, region: districtGeom.bounds(), scale: scale, crs: CONFIG.crs, maxPixels: 1e13,
+    formatOptions: {cloudOptimized: true, noData: noData}});
+}
+
+var TEHSIL_FIELDS = ['tehsil', 'pop2017', 'pop2023', 'growth_pct_yr', 'census_area_km2', 'gis_area_km2',
+  'area_diff_pct', 'density_census', 'density_gis', 'pop_worldpop', 'fit_factor', 'fit_error_pct',
+  'pop_urban_centre', 'pop_urban_cluster', 'pop_rural', 'pop_urban_model', 'pop_rural_model',
+  'urban_share_model_pct', 'km2_urban_centre', 'km2_urban_cluster', 'km2_rural', 'source'];
+
+exportTable(controls, 'A00_control_table', 'CSV',
+  ['id', 'status', 'description', 'observed', 'expected', 'note']);
+exportTable(tehsilStats, 'A01_tehsil_statistics', 'CSV', TEHSIL_FIELDS);
+exportTable(districtFc, 'A02_district_boundary', 'GeoJSON');
+exportTable(tehsilStats, 'A03_tehsil_boundaries', 'GeoJSON');
+exportTable(metro, 'A04_metropolitan_extent', 'GeoJSON');
+exportTable(settlements, 'A05_settlement_patches', 'GeoJSON');
+exportTable(settlementPoints, 'A06_settlement_points', 'GeoJSON');
+exportTable(settlementPoints, 'A07_settlement_table', 'CSV',
+  ['settlement_id', 'tehsil', 'area_ha', 'pop_fitted', 'size_class', 'urban_class']);
+if (ucStats) {
+  exportTable(ucStats, 'A08_union_council_boundaries', 'GeoJSON');
+  exportTable(ucStats, 'A09_union_council_statistics', 'CSV',
+    ['uc_code', 'uc_name', 'area_km2', 'pop2023_census', 'pop_fit_total', 'density_fitted',
+      'pop_urban_centre', 'pop_urban_cluster', 'pop_rural', 'urban_share_model_pct']);
+}
+if (namedSettlements) {
+  exportTable(namedSettlements, 'A10_named_settlements', 'GeoJSON');
+}
+
+// The count grid is exported on its native grid so that its totals survive.
+popProj.evaluate(function (proj) {
+  Export.image.toDrive({image: popFitted.toFloat(), description: 'A11_population_fitted_count',
+    folder: CONFIG.driveFolder, fileNamePrefix: 'A11_population_fitted_count',
+    region: districtGeom.bounds(), crs: proj.crs, crsTransform: proj.transform, maxPixels: 1e13,
+    formatOptions: {cloudOptimized: true, noData: -9999}});
+});
+exportUtm(popDensity.toFloat(), 'A12_population_density_per_km2', 100, -9999);
+exportUtm(urbanClass.clip(districtGeom).unmask(0).toByte(), 'A13_urban_rural_class', 1000, 0);
+exportUtm(built.clip(districtGeom).toFloat(), 'A14_built_surface_m2', 100, -9999);
+
+// ------------------------------- EMBEDDED DATA -------------------------
+// Function declarations are hoisted, so these long blocks can sit at the end.
+
+/* Census values.
+ * pop1998, pop2017, pop2023: citypopulation.de, Punjab admin page, source line
+ *   "Pakistan Bureau of Statistics". The 2017 and 2023 columns sum exactly to the district totals.
+ * census_area_km2: Wikipedia, Faisalabad District tehsil table, citing PBS.
+ * Wikipedia gives different 2017 values for some tehsils (for example Faisalabad City 3,238,841
+ * against 3,244,259 used here). Resolve this from the PBS table if 2017 growth will be published.
+ * growth_pct_yr is calculated here from census dates 15 Mar 2017 and 1 Mar 2023. PBS publishes its
+ * own growth rates, which may differ, so quote PBS rates where they exist.
+ */
+function tehsilCensus() {
+  var years = 5.96;
+  var rows = [
+    {tehsil: 'Chak Jhumra', pop1998: 253806, pop2017: 332966, pop2023: 385169, census_area_km2: 654},
+    {tehsil: 'Faisalabad City', pop1998: 2140346, pop2017: 3244259, pop2023: 3691999, census_area_km2: 168},
+    {tehsil: 'Faisalabad Sadar', pop1998: 924110, pop2017: 1465027, pop2023: 1742958, census_area_km2: 1186},
+    {tehsil: 'Jaranwala', pop1998: 1061846, pop2017: 1493923, pop2023: 1731148, census_area_km2: 1811},
+    {tehsil: 'Samundri', pop1998: 508637, pop2017: 643114, pop2023: 729672, census_area_km2: 754},
+    {tehsil: 'Tandlianwala', pop1998: 540802, pop2017: 703155, pop2023: 794873, census_area_km2: 1284}
+  ];
+  rows.forEach(function (r) {
+    r.growth_pct_yr = (Math.pow(r.pop2023 / r.pop2017, 1 / years) - 1) * 100;
+    r.source = 'PBS 2023 via secondary source, verify against PBS table';
+  });
+  return rows;
+}
+
+/* Tehsil polygons: geoBoundaries gbOpen PAK ADM3, boundaryID PAK-ADM3-9618217, commit 9469f09.
+ * Licence: Open Data Commons Open Database License 1.0. Year represented: 2017.
+ * Names changed to match the census table: FAISALABAD SADDAR to Faisalabad Sadar,
+ * SAMUNDARI to Samundri.
+ */
+function tehsilGeometry() {
+  return {
+    'Chak Jhumra': [[[73.08464,31.62804],[73.09364,31.62067],[73.09979,31.61616],[73.09991,31.61607],[73.10063,31.61555],[73.10626,31.61555],[73.10668,31.61555],[73.1067,31.61552],[73.10882,31.6131],[73.10994,31.61182],[73.10994,31.60111],[73.11114,31.58992],[73.11134,31.58807],[73.11134,31.57503],[73.11229,31.57052],[73.1132,31.56618],[73.12018,31.55966],[73.12384,31.56376],[73.12391,31.56385],[73.12717,31.56664],[73.12717,31.57177],[73.12719,31.57178],[73.12796,31.57256],[73.13137,31.57596],[73.13241,31.57325],[73.13297,31.57178],[73.1337,31.5699],[73.13386,31.56978],[73.13975,31.56525],[73.14674,31.56245],[73.15279,31.56525],[73.15719,31.56525],[73.15838,31.56525],[73.15851,31.56507],[73.16211,31.56012],[73.16737,31.55567],[73.16816,31.555],[73.16857,31.55475],[73.17794,31.54894],[73.1833,31.54569],[73.18866,31.54243],[73.18866,31.54241],[73.18902,31.54174],[73.19378,31.53264],[73.19751,31.52705],[73.20263,31.52473],[73.21055,31.52566],[73.21093,31.52608],[73.21567,31.53125],[73.21893,31.53497],[73.22685,31.5387],[73.2286,31.53583],[73.23197,31.53032],[73.23616,31.52566],[73.23709,31.52007],[73.24548,31.51494],[73.24874,31.50889],[73.2582,31.50717],[73.25899,31.50703],[73.26644,31.50749],[73.27156,31.50889],[73.2744,31.50924],[73.27545,31.50938],[73.27901,31.50982],[73.28554,31.50191],[73.29336,31.50004],[73.29532,31.49957],[73.29779,31.50163],[73.30091,31.50423],[73.30336,31.50767],[73.30556,31.51075],[73.30616,31.51187],[73.30882,31.51681],[73.30929,31.52054],[73.30929,31.52333],[73.30795,31.52489],[73.30789,31.52496],[73.30649,31.52659],[73.30277,31.53078],[73.3037,31.53404],[73.30391,31.53462],[73.30556,31.53916],[73.30696,31.54243],[73.31208,31.54708],[73.31488,31.5536],[73.31475,31.55469],[73.31395,31.56152],[73.31348,31.56851],[73.31348,31.57784],[73.31348,31.57829],[73.31488,31.58019],[73.3186,31.58527],[73.32466,31.589],[73.32978,31.589],[73.33537,31.59645],[73.3391,31.60297],[73.34191,31.60485],[73.34748,31.60856],[73.35252,31.61205],[73.35354,31.61275],[73.36378,31.61275],[73.3703,31.61462],[73.37356,31.62021],[73.37496,31.62673],[73.37485,31.62702],[73.37484,31.62705],[73.37384,31.62964],[73.37263,31.63278],[73.36658,31.63465],[73.36192,31.64024],[73.36565,31.64489],[73.3717,31.64908],[73.3757,31.6528],[73.37822,31.65514],[73.37841,31.65522],[73.3806,31.66179],[73.38687,31.6692],[73.37718,31.66749],[73.37147,31.6749],[73.37154,31.67518],[73.3718,31.67628],[73.37376,31.6846],[73.37627,31.69395],[73.37628,31.69399],[73.37775,31.69942],[73.37605,31.70452],[73.37398,31.71073],[73.3709,31.71995],[73.36342,31.72028],[73.35779,31.72052],[73.34467,31.72052],[73.34219,31.71918],[73.33726,31.71653],[73.32568,31.72116],[73.32301,31.72223],[73.31331,31.72907],[73.30787,31.73223],[73.30519,31.73378],[73.30248,31.73535],[73.29336,31.73649],[73.29305,31.73705],[73.28993,31.74276],[73.29678,31.75074],[73.29678,31.76329],[73.29683,31.76438],[73.29684,31.76457],[73.29343,31.76512],[73.29069,31.76555],[73.28185,31.76666],[73.27904,31.76701],[73.2705,31.76638],[73.26922,31.76628],[73.2532,31.76155],[73.25314,31.76157],[73.24592,31.76374],[73.24534,31.7645],[73.24182,31.76909],[73.23646,31.77611],[73.22855,31.78366],[73.22688,31.78057],[73.21418,31.77537],[73.20318,31.76267],[73.19919,31.75832],[73.18988,31.74817],[73.17559,31.73747],[73.17158,31.73447],[73.15045,31.71868],[73.14978,31.71817],[73.14818,31.71697],[73.14298,31.70927],[73.13718,31.70077],[73.13509,31.69726],[73.12618,31.68227],[73.12348,31.67747],[73.11991,31.67109],[73.11508,31.66247],[73.11408,31.66077],[73.11394,31.66052],[73.10875,31.65095],[73.10188,31.63827],[73.08508,31.62947],[73.08464,31.62804]]],
+    'Faisalabad City': [[[73.10692,31.51125],[73.10704,31.51171],[73.10706,31.51178],[73.1103,31.52391],[73.09088,31.52644],[73.09064,31.52575],[73.08581,31.51209],[73.08027,31.50907],[73.07653,31.50702],[73.07353,31.51093],[73.06808,31.518],[73.05711,31.51209],[73.05626,31.49943],[73.05689,31.49723],[73.06133,31.4817],[73.06049,31.47326],[73.05648,31.46457],[73.05542,31.46228],[73.05372,31.46029],[73.04529,31.45046],[73.03178,31.44455],[73.03162,31.44479],[73.02421,31.4559],[73.0242,31.45592],[73.02334,31.45721],[73.01421,31.46634],[73.01236,31.46819],[73.01236,31.46903],[73.00139,31.45975],[72.99671,31.44832],[72.99442,31.44272],[72.99441,31.44268],[72.99379,31.44117],[72.99464,31.42344],[73.00897,31.41468],[73.00901,31.41466],[73.00983,31.41416],[73.02334,31.40656],[73.03413,31.39955],[73.04023,31.39558],[73.04095,31.39377],[73.0421,31.3909],[73.0436,31.38714],[73.04388,31.38565],[73.04424,31.38375],[73.0459,31.37491],[73.04613,31.37363],[73.04697,31.3735],[73.05679,31.37195],[73.06217,31.3711],[73.07484,31.3711],[73.07935,31.36794],[73.08328,31.36519],[73.08372,31.36187],[73.08497,31.35253],[73.0866,31.3513],[73.0951,31.34493],[73.09893,31.34212],[73.10777,31.33564],[73.1147,31.33713],[73.11471,31.33713],[73.11959,31.33817],[73.12539,31.35725],[73.1255,31.35759],[73.13024,31.36407],[73.13478,31.37026],[73.14441,31.38694],[73.14745,31.39221],[73.14803,31.39289],[73.15842,31.40487],[73.17109,31.4131],[73.17531,31.41585],[73.18184,31.41756],[73.19135,31.42007],[73.19219,31.43358],[73.19195,31.43599],[73.19104,31.44513],[73.1905,31.45046],[73.19187,31.45865],[73.1929,31.46482],[73.1929,31.46483],[73.19303,31.46566],[73.18819,31.46792],[73.18558,31.46914],[73.18556,31.46915],[73.18037,31.47157],[73.16855,31.47579],[73.1599,31.4824],[73.1548,31.48631],[73.1542,31.48676],[73.1517,31.4861],[73.15154,31.48605],[73.14154,31.48339],[73.12718,31.47916],[73.11573,31.47773],[73.11368,31.47748],[73.10035,31.48296],[73.09932,31.48339],[73.09833,31.48835],[73.09763,31.49183],[73.10327,31.50361],[73.10692,31.51125]]],
+    'Faisalabad Sadar': [[[72.82508,31.36807],[72.82632,31.36769],[72.83003,31.36049],[72.83037,31.35983],[72.82111,31.3442],[72.8099,31.3322],[72.81006,31.33195],[72.81446,31.32516],[72.81943,31.31748],[72.82048,31.31585],[72.82188,31.31472],[72.8218,31.31466],[72.82206,31.31445],[72.83369,31.30497],[72.83553,31.30299],[72.83836,31.29994],[72.84579,31.29192],[72.84961,31.28822],[72.85342,31.28454],[72.85346,31.28459],[72.85387,31.2842],[72.85751,31.28069],[72.85965,31.27862],[72.85962,31.27856],[72.85981,31.27837],[72.85498,31.26822],[72.85409,31.26527],[72.85207,31.25854],[72.84888,31.25668],[72.84047,31.25177],[72.83756,31.24017],[72.83655,31.23878],[72.82992,31.22969],[72.82791,31.22694],[72.82451,31.22227],[72.81527,31.21489],[72.81241,31.2126],[72.81164,31.21207],[72.81121,31.21213],[72.79871,31.20365],[72.78952,31.2022],[72.77985,31.19785],[72.77913,31.19677],[72.77938,31.19667],[72.77517,31.19035],[72.77663,31.17439],[72.78146,31.16375],[72.78511,31.15605],[72.78513,31.15606],[72.7867,31.15648],[72.79469,31.16048],[72.79508,31.16067],[72.7965,31.16138],[72.80496,31.1645],[72.81476,31.16762],[72.82188,31.16717],[72.8264,31.1633],[72.82812,31.16183],[72.84415,31.15604],[72.84695,31.15481],[72.8473,31.15466],[72.85122,31.15295],[72.85132,31.15289],[72.85883,31.15114],[72.85889,31.15112],[72.85895,31.15114],[72.86094,31.15162],[72.86262,31.15201],[72.86464,31.15247],[72.86834,31.15325],[72.8731,31.15426],[72.87345,31.15503],[72.87477,31.15784],[72.87488,31.15808],[72.87765,31.16405],[72.88468,31.16405],[72.89626,31.16361],[72.89982,31.16361],[72.90874,31.16753],[72.91096,31.16851],[72.91942,31.17207],[72.92315,31.17224],[72.92486,31.1723],[72.92511,31.1723],[72.92932,31.17249],[72.93532,31.17346],[72.93991,31.17416],[72.94658,31.17519],[72.96128,31.17519],[72.96748,31.17469],[72.97241,31.1743],[72.97647,31.17353],[72.98169,31.17249],[72.98341,31.17223],[72.98934,31.17118],[72.99069,31.17118],[72.99188,31.17118],[72.99913,31.17118],[73.00735,31.17332],[73.00938,31.17385],[73.00946,31.17387],[73.01384,31.17515],[73.01413,31.17524],[73.02007,31.17697],[73.02301,31.18089],[73.02491,31.18343],[73.02675,31.18588],[73.03342,31.193],[73.03908,31.19003],[73.04065,31.1892],[73.04189,31.18855],[73.04413,31.18648],[73.04743,31.18343],[73.04757,31.18331],[73.04768,31.1832],[73.05438,31.18077],[73.0553,31.18043],[73.05648,31.18001],[73.05748,31.17964],[73.06505,31.17964],[73.07485,31.18098],[73.07617,31.18221],[73.07792,31.18383],[73.08105,31.18674],[73.08108,31.18677],[73.08114,31.18674],[73.08643,31.18409],[73.08954,31.18187],[73.0931,31.17876],[73.09419,31.1778],[73.09421,31.17778],[73.09667,31.17563],[73.10199,31.17522],[73.10246,31.17519],[73.10259,31.17529],[73.10401,31.17648],[73.10513,31.17741],[73.10714,31.17882],[73.10958,31.18053],[73.11115,31.18112],[73.11313,31.18186],[73.11671,31.1832],[73.1225,31.18766],[73.12962,31.18454],[73.13319,31.18009],[73.14031,31.18187],[73.14148,31.18228],[73.14704,31.18422],[73.14738,31.18447],[73.14745,31.18452],[73.15059,31.19521],[73.15167,31.19887],[73.1522,31.20048],[73.15758,31.2166],[73.16155,31.22569],[73.16182,31.2263],[73.16205,31.22683],[73.16326,31.22958],[73.16349,31.23011],[73.17382,31.2374],[73.17784,31.24024],[73.17785,31.24027],[73.18014,31.25059],[73.18052,31.25232],[73.18053,31.25236],[73.18121,31.25544],[73.17953,31.27063],[73.18194,31.27239],[73.18881,31.27739],[73.199,31.27799],[73.20317,31.27823],[73.20317,31.27863],[73.20317,31.28483],[73.20317,31.28486],[73.20317,31.29427],[73.19568,31.30176],[73.1905,31.30694],[73.19135,31.31622],[73.18948,31.32367],[73.18889,31.32606],[73.18881,31.32635],[73.20232,31.33226],[73.21667,31.33733],[73.22713,31.33843],[73.2321,31.33895],[73.23271,31.33902],[73.24116,31.35421],[73.24293,31.36013],[73.24622,31.3711],[73.23356,31.37194],[73.23002,31.37742],[73.2251,31.38502],[73.22427,31.3863],[73.22626,31.39953],[73.2268,31.40318],[73.22711,31.41492],[73.22765,31.43611],[73.22795,31.4374],[73.22875,31.44089],[73.23271,31.45806],[73.23947,31.4741],[73.23973,31.47453],[73.24115,31.4769],[73.24129,31.47713],[73.24502,31.48335],[73.2496,31.49098],[73.2556,31.50238],[73.25804,31.50702],[73.2582,31.50717],[73.24874,31.50889],[73.24548,31.51494],[73.23709,31.52007],[73.23616,31.52566],[73.23197,31.53032],[73.2286,31.53583],[73.22685,31.5387],[73.21893,31.53497],[73.21567,31.53125],[73.21093,31.52608],[73.21055,31.52566],[73.20263,31.52473],[73.19751,31.52705],[73.19378,31.53264],[73.18902,31.54174],[73.18866,31.54241],[73.18866,31.54243],[73.1833,31.54569],[73.17794,31.54894],[73.16857,31.55475],[73.16816,31.555],[73.16737,31.55567],[73.16211,31.56012],[73.15851,31.56507],[73.15838,31.56525],[73.15719,31.56525],[73.15279,31.56525],[73.14674,31.56245],[73.13975,31.56525],[73.13386,31.56978],[73.1337,31.5699],[73.13297,31.57178],[73.13241,31.57325],[73.13137,31.57596],[73.12796,31.57256],[73.12719,31.57178],[73.12717,31.57177],[73.12717,31.56664],[73.12391,31.56385],[73.12384,31.56376],[73.12018,31.55966],[73.1132,31.56618],[73.11229,31.57052],[73.11134,31.57503],[73.11134,31.58807],[73.11114,31.58992],[73.10994,31.60111],[73.10994,31.61182],[73.10882,31.6131],[73.1067,31.61552],[73.10668,31.61555],[73.10626,31.61555],[73.10063,31.61555],[73.09991,31.61607],[73.09979,31.61616],[73.09364,31.62067],[73.08464,31.62804],[73.08048,31.61447],[73.07563,31.60685],[73.07167,31.60061],[73.06948,31.59717],[73.06922,31.59697],[73.06768,31.59577],[73.05611,31.58532],[73.05418,31.58357],[73.04982,31.57961],[73.04868,31.57857],[73.03903,31.57671],[73.03833,31.57657],[73.03413,31.57573],[73.02198,31.56587],[73.01435,31.56631],[73.01158,31.56647],[73.01157,31.56646],[72.99888,31.55867],[72.98898,31.55257],[72.98498,31.55147],[72.98495,31.55149],[72.97939,31.54999],[72.97744,31.54946],[72.97744,31.54943],[72.96758,31.54677],[72.95308,31.54097],[72.9518,31.53988],[72.93428,31.52497],[72.92998,31.52127],[72.92698,31.51935],[72.90918,31.50797],[72.89732,31.50204],[72.89718,31.50197],[72.89298,31.49987],[72.88428,31.48657],[72.87483,31.47713],[72.87388,31.47617],[72.8685,31.46432],[72.86198,31.44997],[72.85681,31.43848],[72.85528,31.43507],[72.84498,31.42897],[72.83968,31.42577],[72.83399,31.40989],[72.83388,31.40957],[72.82908,31.40227],[72.82408,31.39457],[72.8227,31.38843],[72.82058,31.37897],[72.82085,31.37831],[72.82508,31.36807]],[[73.10692,31.51125],[73.10327,31.50361],[73.09763,31.49183],[73.09833,31.48835],[73.09932,31.48339],[73.10035,31.48296],[73.11368,31.47748],[73.11573,31.47773],[73.12718,31.47916],[73.14154,31.48339],[73.15154,31.48605],[73.1517,31.4861],[73.1542,31.48676],[73.1548,31.48631],[73.1599,31.4824],[73.16855,31.47579],[73.18037,31.47157],[73.18556,31.46915],[73.18558,31.46914],[73.18819,31.46792],[73.19303,31.46566],[73.1929,31.46483],[73.1929,31.46482],[73.19187,31.45865],[73.1905,31.45046],[73.19104,31.44513],[73.19195,31.43599],[73.19219,31.43358],[73.19135,31.42007],[73.18184,31.41756],[73.17531,31.41585],[73.17109,31.4131],[73.15842,31.40487],[73.14803,31.39289],[73.14745,31.39221],[73.14441,31.38694],[73.13478,31.37026],[73.13024,31.36407],[73.1255,31.35759],[73.12539,31.35725],[73.11959,31.33817],[73.11471,31.33713],[73.1147,31.33713],[73.10777,31.33564],[73.09893,31.34212],[73.0951,31.34493],[73.0866,31.3513],[73.08497,31.35253],[73.08372,31.36187],[73.08328,31.36519],[73.07935,31.36794],[73.07484,31.3711],[73.06217,31.3711],[73.05679,31.37195],[73.04697,31.3735],[73.04613,31.37363],[73.0459,31.37491],[73.04424,31.38375],[73.04388,31.38565],[73.0436,31.38714],[73.0421,31.3909],[73.04095,31.39377],[73.04023,31.39558],[73.03413,31.39955],[73.02334,31.40656],[73.00983,31.41416],[73.00901,31.41466],[73.00897,31.41468],[72.99464,31.42344],[72.99379,31.44117],[72.99441,31.44268],[72.99442,31.44272],[72.99671,31.44832],[73.00139,31.45975],[73.01236,31.46903],[73.01236,31.46819],[73.01421,31.46634],[73.02334,31.45721],[73.0242,31.45592],[73.02421,31.4559],[73.03162,31.44479],[73.03178,31.44455],[73.04529,31.45046],[73.05372,31.46029],[73.05542,31.46228],[73.05648,31.46457],[73.06049,31.47326],[73.06133,31.4817],[73.05689,31.49723],[73.05626,31.49943],[73.05711,31.51209],[73.06808,31.518],[73.07353,31.51093],[73.07653,31.50702],[73.08027,31.50907],[73.08581,31.51209],[73.09064,31.52575],[73.09088,31.52644],[73.1103,31.52391],[73.10706,31.51178],[73.10704,31.51171],[73.10692,31.51125]]],
+    'Jaranwala': [[[73.2582,31.50717],[73.25804,31.50702],[73.2556,31.50238],[73.2496,31.49098],[73.24502,31.48335],[73.24129,31.47713],[73.24115,31.4769],[73.23973,31.47453],[73.23947,31.4741],[73.23271,31.45806],[73.22875,31.44089],[73.22795,31.4374],[73.22765,31.43611],[73.22711,31.41492],[73.2268,31.40318],[73.22626,31.39953],[73.22427,31.3863],[73.2251,31.38502],[73.23002,31.37742],[73.23356,31.37194],[73.24622,31.3711],[73.24293,31.36013],[73.24116,31.35421],[73.23271,31.33902],[73.2321,31.33895],[73.22713,31.33843],[73.21667,31.33733],[73.20232,31.33226],[73.18881,31.32635],[73.18889,31.32606],[73.18948,31.32367],[73.19135,31.31622],[73.1905,31.30694],[73.19568,31.30176],[73.20317,31.29427],[73.20317,31.28486],[73.20317,31.28483],[73.20317,31.27863],[73.20317,31.27823],[73.199,31.27799],[73.18881,31.27739],[73.18194,31.27239],[73.17953,31.27063],[73.18121,31.25544],[73.18053,31.25236],[73.18052,31.25232],[73.18014,31.25059],[73.17785,31.24027],[73.17784,31.24024],[73.17382,31.2374],[73.16349,31.23011],[73.16326,31.22958],[73.16205,31.22683],[73.16182,31.2263],[73.16155,31.22569],[73.15758,31.2166],[73.1522,31.20048],[73.15167,31.19887],[73.15059,31.19521],[73.14745,31.18452],[73.14738,31.18447],[73.14704,31.18422],[73.14921,31.18498],[73.15143,31.17969],[73.15145,31.17964],[73.16303,31.1792],[73.16878,31.17801],[73.16898,31.17796],[73.16953,31.17785],[73.17594,31.17652],[73.17605,31.17652],[73.17609,31.17652],[73.18451,31.17652],[73.18587,31.17685],[73.18841,31.17741],[73.18841,31.17748],[73.18848,31.17749],[73.18848,31.18408],[73.18896,31.18404],[73.1981,31.18321],[73.19821,31.1832],[73.20801,31.17831],[73.212,31.17751],[73.21691,31.17652],[73.21706,31.17643],[73.22538,31.17118],[73.22958,31.17328],[73.23102,31.174],[73.2325,31.17474],[73.24096,31.17697],[73.24476,31.17729],[73.24792,31.17755],[73.25165,31.17786],[73.25486,31.17635],[73.25922,31.1743],[73.2612,31.17033],[73.26189,31.16895],[73.2628,31.1676],[73.26635,31.16227],[73.27347,31.1596],[73.28156,31.15839],[73.28169,31.15837],[73.28238,31.15827],[73.29218,31.15827],[73.30465,31.15827],[73.30955,31.15559],[73.3082,31.15364],[73.30554,31.1498],[73.29515,31.1498],[73.29351,31.1498],[73.27748,31.15069],[73.2766,31.15073],[73.27275,31.15091],[73.26854,31.1511],[73.26768,31.15114],[73.26459,31.15168],[73.25744,31.15292],[73.25586,31.15355],[73.24853,31.15648],[73.24851,31.15648],[73.24848,31.1565],[73.2417,31.15613],[73.24155,31.15613],[73.24109,31.15613],[73.24102,31.15604],[73.24096,31.15604],[73.2368,31.15104],[73.23651,31.15069],[73.23153,31.14771],[73.22888,31.14612],[73.23238,31.1447],[73.23427,31.14402],[73.23428,31.14401],[73.23651,31.13555],[73.23651,31.1262],[73.24171,31.11951],[73.24274,31.11818],[73.24675,31.11239],[73.25454,31.10707],[73.25521,31.1066],[73.25725,31.10152],[73.25878,31.0977],[73.26412,31.09324],[73.26412,31.08923],[73.26709,31.08825],[73.2708,31.08701],[73.27125,31.08166],[73.27615,31.08166],[73.27671,31.08166],[73.28372,31.08166],[73.29084,31.0781],[73.29084,31.07409],[73.29307,31.07053],[73.30198,31.07187],[73.30633,31.07387],[73.30777,31.07454],[73.31222,31.07587],[73.31979,31.07008],[73.3227,31.06887],[73.32354,31.06852],[73.32514,31.06786],[73.33434,31.06911],[73.33493,31.06919],[73.3425,31.07008],[73.34659,31.07204],[73.35069,31.074],[73.35275,31.07498],[73.35553,31.07823],[73.35809,31.08122],[73.35943,31.08523],[73.36063,31.08673],[73.36299,31.08968],[73.36358,31.09031],[73.36878,31.09592],[73.37724,31.09814],[73.37812,31.09865],[73.38259,31.10126],[73.37591,31.10527],[73.37412,31.11017],[73.36655,31.11551],[73.36165,31.11996],[73.3621,31.12442],[73.36433,31.12709],[73.3697,31.13067],[73.37295,31.13284],[73.37303,31.13289],[73.37368,31.13332],[73.38259,31.1329],[73.38303,31.13288],[73.38305,31.13289],[73.38748,31.13689],[73.39684,31.13867],[73.39835,31.14001],[73.40085,31.14223],[73.40583,31.14261],[73.40663,31.14268],[73.4081,31.14347],[73.41732,31.14847],[73.42489,31.14891],[73.44288,31.1476],[73.44698,31.15433],[73.44699,31.15434],[73.44701,31.15437],[73.44731,31.15487],[73.44739,31.15497],[73.44929,31.15742],[73.45065,31.15918],[73.461,31.17255],[73.4619,31.1733],[73.46237,31.1737],[73.47525,31.18452],[73.47533,31.1845],[73.47552,31.18445],[73.47634,31.18423],[73.48381,31.18224],[73.48701,31.18224],[73.49008,31.18224],[73.49256,31.18429],[73.49297,31.18462],[73.50001,31.19007],[73.50007,31.19004],[73.50269,31.18837],[73.50604,31.18623],[73.51113,31.18496],[73.51289,31.18452],[73.51855,31.18452],[73.52543,31.18452],[73.52919,31.1864],[73.53205,31.18783],[73.53227,31.18794],[73.53398,31.19208],[73.53396,31.1921],[73.53626,31.1977],[73.54256,31.1977],[73.54886,31.1977],[73.55236,31.2012],[73.55236,31.20119],[73.55565,31.20448],[73.55823,31.20757],[73.56365,31.21408],[73.56421,31.21474],[73.56899,31.22065],[73.5739,31.22672],[73.5796,31.23185],[73.58098,31.23215],[73.58106,31.23216],[73.58501,31.23301],[73.58584,31.23319],[73.58646,31.23332],[73.58758,31.23356],[73.58872,31.23979],[73.58876,31.2399],[73.59045,31.24838],[73.59728,31.24553],[73.59857,31.24628],[73.60186,31.24818],[73.60428,31.24959],[73.60811,31.25181],[73.61314,31.25838],[73.6136,31.25898],[73.61553,31.2615],[73.62361,31.26371],[73.62368,31.26372],[73.628,31.2649],[73.62806,31.26492],[73.62807,31.26492],[73.62881,31.26546],[73.63813,31.27219],[73.6383,31.27231],[73.63951,31.27288],[73.64575,31.27576],[73.64889,31.27769],[73.6514,31.27924],[73.65316,31.2803],[73.65346,31.2824],[73.65376,31.2878],[73.65206,31.2974],[73.65886,31.3014],[73.65937,31.30228],[73.66285,31.30826],[73.6666,31.31608],[73.66675,31.3164],[73.67026,31.3219],[73.67026,31.33327],[73.67027,31.33335],[73.67026,31.33336],[73.66597,31.34141],[73.6657,31.3419],[73.66324,31.34888],[73.66228,31.35159],[73.66542,31.36147],[73.66627,31.36414],[73.67047,31.36805],[73.67326,31.3706],[73.67486,31.3721],[73.67626,31.3738],[73.67768,31.37551],[73.67851,31.37649],[73.68395,31.38295],[73.68395,31.38299],[73.68395,31.38841],[73.68396,31.3938],[73.68256,31.3955],[73.67941,31.39923],[73.67866,31.4001],[73.67486,31.4046],[73.67766,31.4094],[73.67886,31.4115],[73.67656,31.4195],[73.67552,31.42073],[73.67547,31.42071],[73.6734,31.42316],[73.67027,31.42686],[73.67027,31.42689],[73.67027,31.43427],[73.67928,31.43905],[73.67996,31.4394],[73.67991,31.43948],[73.67806,31.4424],[73.67546,31.4463],[73.66796,31.4486],[73.66018,31.45217],[73.65944,31.45252],[73.65376,31.4571],[73.65367,31.45706],[73.64673,31.45358],[73.6437,31.45207],[73.64346,31.452],[73.62636,31.4531],[73.62006,31.448],[73.61576,31.447],[73.61156,31.4457],[73.60531,31.44291],[73.60127,31.44112],[73.5984,31.44276],[73.59677,31.44369],[73.59397,31.44529],[73.5853,31.45024],[73.57789,31.4491],[73.57067,31.44378],[73.56706,31.44112],[73.56608,31.4402],[73.56441,31.43865],[73.55868,31.4333],[73.5585,31.43313],[73.55052,31.42686],[73.55039,31.4268],[73.54381,31.42388],[73.54026,31.4223],[73.54001,31.42226],[73.52843,31.42061],[73.52838,31.4206],[73.52828,31.42059],[73.52824,31.4206],[73.52809,31.42065],[73.52001,31.42311],[73.51804,31.42371],[73.51527,31.42455],[73.51516,31.4246],[73.50206,31.4417],[73.49801,31.4453],[73.49666,31.4465],[73.49487,31.44807],[73.49179,31.45081],[73.4781,31.46107],[73.46616,31.4725],[73.46776,31.47573],[73.46967,31.47956],[73.47126,31.48274],[73.47719,31.4874],[73.47924,31.48901],[73.48289,31.4911],[73.48723,31.49358],[73.48723,31.51025],[73.48723,31.51068],[73.4868,31.5213],[73.48666,31.52494],[73.49065,31.53349],[73.48854,31.53618],[73.48438,31.54147],[73.4724,31.54889],[73.47023,31.55069],[73.46881,31.55188],[73.46556,31.55459],[73.4724,31.55801],[73.46157,31.56371],[73.45462,31.56718],[73.45359,31.5677],[73.45715,31.58055],[73.45718,31.58065],[73.45929,31.58823],[73.46043,31.60306],[73.46043,31.60472],[73.46043,31.61731],[73.45505,31.6243],[73.45472,31.62473],[73.45424,31.6251],[73.44674,31.631],[73.43299,31.63705],[73.43249,31.63727],[73.42964,31.63801],[73.42546,31.6391],[73.41937,31.64069],[73.41035,31.6452],[73.40773,31.64651],[73.40341,31.64867],[73.392,31.65495],[73.38755,31.65495],[73.38282,31.65495],[73.37832,31.65495],[73.37841,31.65522],[73.37822,31.65514],[73.3757,31.6528],[73.3717,31.64908],[73.36565,31.64489],[73.36192,31.64024],[73.36658,31.63465],[73.37263,31.63278],[73.37384,31.62964],[73.37484,31.62705],[73.37485,31.62702],[73.37496,31.62673],[73.37356,31.62021],[73.3703,31.61462],[73.36378,31.61275],[73.35354,31.61275],[73.35252,31.61205],[73.34748,31.60856],[73.34191,31.60485],[73.3391,31.60297],[73.33537,31.59645],[73.32978,31.589],[73.32466,31.589],[73.3186,31.58527],[73.31488,31.58019],[73.31348,31.57829],[73.31348,31.57784],[73.31348,31.56851],[73.31395,31.56152],[73.31475,31.55469],[73.31488,31.5536],[73.31208,31.54708],[73.30696,31.54243],[73.30556,31.53916],[73.30391,31.53462],[73.3037,31.53404],[73.30277,31.53078],[73.30649,31.52659],[73.30789,31.52496],[73.30795,31.52489],[73.30929,31.52333],[73.30929,31.52054],[73.30882,31.51681],[73.30616,31.51187],[73.30556,31.51075],[73.30336,31.50767],[73.30091,31.50423],[73.29779,31.50163],[73.29532,31.49957],[73.29336,31.50004],[73.28554,31.50191],[73.27901,31.50982],[73.27545,31.50938],[73.2744,31.50924],[73.27156,31.50889],[73.26644,31.50749],[73.25899,31.50703],[73.2582,31.50717]]],
+    'Samundri': [[[72.78511,31.15605],[72.78568,31.15485],[72.78581,31.15456],[72.78552,31.15406],[72.77808,31.1415],[72.77837,31.14005],[72.78049,31.12941],[72.78071,31.12485],[72.78098,31.11926],[72.78025,31.11718],[72.77752,31.10946],[72.77517,31.10281],[72.76965,31.09787],[72.76598,31.09459],[72.75757,31.09309],[72.75244,31.09217],[72.74191,31.08759],[72.74146,31.0874],[72.74132,31.08734],[72.74332,31.08567],[72.74481,31.08442],[72.75002,31.08008],[72.76646,31.07081],[72.76842,31.0697],[72.76889,31.06944],[72.76941,31.0697],[72.77695,31.07347],[72.77953,31.07476],[72.79049,31.0841],[72.79259,31.08588],[72.79804,31.08252],[72.80903,31.07573],[72.81764,31.07019],[72.82251,31.06706],[72.82251,31.06693],[72.82249,31.06691],[72.82031,31.06373],[72.81789,31.06021],[72.81725,31.05928],[72.81387,31.05155],[72.8155,31.04581],[72.81671,31.04169],[72.82031,31.0329],[72.8205,31.0321],[72.82048,31.0321],[72.82064,31.03172],[72.81997,31.03139],[72.81389,31.02843],[72.80274,31.02301],[72.80081,31.01817],[72.79791,31.00705],[72.79783,31.00535],[72.79777,31.00389],[72.79776,31.00381],[72.79742,30.99593],[72.79694,30.98529],[72.78809,30.97865],[72.78789,30.97885],[72.78711,30.97827],[72.77551,30.96729],[72.77584,30.96097],[72.77588,30.96008],[72.77589,30.95995],[72.77636,30.95463],[72.77649,30.95313],[72.77173,30.94452],[72.77168,30.94451],[72.77163,30.94442],[72.76891,30.94383],[72.7685,30.94373],[72.76819,30.94367],[72.76757,30.94354],[72.7605,30.942],[72.74938,30.9362],[72.74745,30.93595],[72.74421,30.93552],[72.73826,30.93475],[72.73548,30.92133],[72.73443,30.92003],[72.73031,30.91483],[72.72616,30.9096],[72.71642,30.89985],[72.71439,30.89782],[72.71407,30.89751],[72.70753,30.88987],[72.70551,30.88751],[72.70537,30.88735],[72.70551,30.8861],[72.70682,30.87429],[72.71156,30.86771],[72.71552,30.8622],[72.72408,30.86181],[72.72616,30.86172],[72.72715,30.86166],[72.7293,30.86152],[72.72936,30.86152],[72.73049,30.86145],[72.73058,30.86144],[72.7339,30.86123],[72.74358,30.85736],[72.75228,30.85011],[72.75315,30.84974],[72.76046,30.84654],[72.76051,30.84658],[72.76244,30.84576],[72.76258,30.84561],[72.77382,30.85145],[72.77393,30.8515],[72.77537,30.85294],[72.77547,30.85304],[72.7754,30.8531],[72.77545,30.85315],[72.77551,30.85309],[72.78412,30.86212],[72.78649,30.86472],[72.78664,30.86489],[72.78668,30.86493],[72.78759,30.86591],[72.7876,30.86592],[72.78761,30.86591],[72.79116,30.86968],[72.79393,30.87152],[72.80116,30.87617],[72.80133,30.87628],[72.80329,30.87769],[72.80951,30.87988],[72.81009,30.88658],[72.81128,30.90051],[72.8116,30.90189],[72.81211,30.90375],[72.81333,30.90823],[72.81361,30.90924],[72.81389,30.91022],[72.81719,30.91305],[72.82013,30.91553],[72.82471,30.91828],[72.82565,30.92235],[72.82569,30.92249],[72.82648,30.9267],[72.82708,30.9273],[72.82708,30.9273],[72.83228,30.9325],[72.83485,30.93519],[72.83612,30.93653],[72.84113,30.93292],[72.84509,30.93213],[72.84992,30.9339],[72.85363,30.93486],[72.8537,30.93488],[72.85748,30.93573],[72.86623,30.93521],[72.86768,30.93512],[72.86775,30.93514],[72.87221,30.93648],[72.87889,30.93737],[72.88149,30.93919],[72.88349,30.94049],[72.88418,30.94082],[72.88568,30.94153],[72.88577,30.94156],[72.88772,30.94227],[72.88788,30.94232],[72.88797,30.94227],[72.89181,30.93977],[72.89191,30.9397],[72.89181,30.93917],[72.8905,30.9325],[72.89009,30.9313],[72.89004,30.9312],[72.88733,30.92545],[72.88695,30.92322],[72.88611,30.91824],[72.88593,30.91269],[72.88591,30.91251],[72.88568,30.91028],[72.88775,30.90915],[72.89181,30.90693],[72.89227,30.90668],[72.89551,30.90228],[72.89592,30.90026],[72.89593,30.90023],[72.89654,30.89723],[72.89673,30.89649],[72.8967,30.89641],[72.8949,30.89209],[72.89496,30.89204],[72.89492,30.89194],[72.89604,30.891],[72.90338,30.88482],[72.90565,30.88381],[72.90739,30.88303],[72.91266,30.88359],[72.91434,30.88377],[72.9148,30.88381],[72.9159,30.88391],[72.91837,30.88555],[72.92188,30.88788],[72.92347,30.88888],[72.92352,30.88892],[72.92548,30.89131],[72.92707,30.89325],[72.92712,30.89331],[72.92868,30.89645],[72.93048,30.90009],[72.93408,30.90491],[72.93848,30.9143],[72.93988,30.9223],[72.94011,30.9227],[72.9444,30.93041],[72.94482,30.93116],[72.94489,30.93128],[72.94549,30.93259],[72.94626,30.93426],[72.94629,30.93433],[72.9471,30.93598],[72.94892,30.9397],[72.95471,30.94812],[72.95838,30.95478],[72.95861,30.95518],[72.96304,30.95938],[72.96388,30.96018],[72.96707,30.9632],[72.9683,30.96538],[72.97113,30.97028],[72.9693,30.97492],[72.96851,30.98151],[72.97426,30.98726],[72.97431,30.98731],[72.97529,30.98746],[72.97553,30.98749],[72.98053,30.98828],[72.98149,30.98845],[72.9902,30.98991],[72.99023,30.98992],[72.9903,30.98993],[72.99351,30.98848],[72.99358,30.98845],[72.99578,30.98745],[72.9961,30.98731],[72.99707,30.98684],[72.99801,30.98639],[72.99812,30.98637],[72.99856,30.98627],[72.99896,30.98599],[72.99909,30.9859],[73.00144,30.98531],[73.00856,30.98352],[73.00952,30.98328],[73.01187,30.98172],[73.0119,30.98169],[73.01456,30.97978],[73.01471,30.97968],[73.01472,30.97968],[73.0156,30.98143],[73.01801,30.98618],[73.01929,30.98871],[73.01944,30.9902],[73.01946,30.99036],[73.02007,30.99616],[73.02008,30.99628],[73.02441,31.00397],[73.02448,31.00409],[73.02452,31.00417],[73.02407,31.00522],[73.02344,31.00699],[73.02332,31.00733],[73.02191,31.0105],[73.02039,31.0133],[73.01929,31.01532],[73.01884,31.01899],[73.01873,31.0199],[73.01868,31.02033],[73.01873,31.02054],[73.02008,31.02612],[73.02368,31.03009],[73.02548,31.03108],[73.02912,31.03308],[73.03351,31.03528],[73.03711,31.04071],[73.03891,31.04141],[73.0423,31.04273],[73.04233,31.04273],[73.04289,31.0429],[73.04413,31.04328],[73.04435,31.04241],[73.04547,31.03809],[73.04608,31.0351],[73.04613,31.0349],[73.04688,31.03131],[73.04608,31.02672],[73.0459,31.0257],[73.04592,31.0257],[73.05353,31.02692],[73.05353,31.02033],[73.05628,31.01489],[73.05872,31.01392],[73.05877,31.01389],[73.05963,31.0134],[73.0597,31.01337],[73.05982,31.0133],[73.06012,31.01312],[73.0617,31.01224],[73.06592,31.00989],[73.06806,31.0101],[73.06847,31.01014],[73.07217,31.01041],[73.0725,31.01069],[73.07417,31.0121],[73.07796,31.01531],[73.08375,31.01753],[73.08954,31.02243],[73.08923,31.0232],[73.08889,31.02415],[73.08789,31.02692],[73.08807,31.03132],[73.08808,31.0315],[73.08817,31.03523],[73.08832,31.04108],[73.08789,31.04907],[73.09809,31.05268],[73.09851,31.05943],[73.09851,31.05951],[73.09927,31.05994],[73.09991,31.0603],[73.09992,31.06031],[73.10231,31.06197],[73.10651,31.06488],[73.11065,31.0665],[73.11072,31.06653],[73.11369,31.0675],[73.11371,31.06751],[73.11805,31.07142],[73.12368,31.07575],[73.12383,31.07587],[73.1239,31.07593],[73.12567,31.08008],[73.12568,31.08011],[73.12653,31.08209],[73.13111,31.09149],[73.13287,31.09412],[73.1347,31.0965],[73.1355,31.09772],[73.1369,31.10571],[73.14429,31.10791],[73.1507,31.11249],[73.1514,31.11324],[73.15186,31.1137],[73.15189,31.11367],[73.15193,31.11372],[73.15217,31.11396],[73.1573,31.11909],[73.16164,31.12377],[73.16182,31.12396],[73.16392,31.1262],[73.16803,31.12596],[73.17152,31.12568],[73.1743,31.12716],[73.17598,31.12806],[73.1761,31.12812],[73.17731,31.1303],[73.17996,31.13535],[73.17998,31.13538],[73.18129,31.13778],[73.18604,31.13979],[73.19286,31.14268],[73.1975,31.14317],[73.19874,31.1433],[73.20227,31.14368],[73.21509,31.14447],[73.22449,31.14771],[73.22888,31.14612],[73.23153,31.14771],[73.23651,31.15069],[73.2368,31.15104],[73.24096,31.15604],[73.24102,31.15604],[73.24109,31.15613],[73.24155,31.15613],[73.2417,31.15613],[73.24848,31.1565],[73.24851,31.15648],[73.24853,31.15648],[73.25586,31.15355],[73.25744,31.15292],[73.26459,31.15168],[73.26768,31.15114],[73.26854,31.1511],[73.27275,31.15091],[73.2766,31.15073],[73.27748,31.15069],[73.29351,31.1498],[73.29515,31.1498],[73.30554,31.1498],[73.3082,31.15364],[73.30955,31.15559],[73.30465,31.15827],[73.29218,31.15827],[73.28238,31.15827],[73.28169,31.15837],[73.28156,31.15839],[73.27347,31.1596],[73.26635,31.16227],[73.2628,31.1676],[73.26189,31.16895],[73.2612,31.17033],[73.25922,31.1743],[73.25486,31.17635],[73.25165,31.17786],[73.24792,31.17755],[73.24476,31.17729],[73.24096,31.17697],[73.2325,31.17474],[73.23102,31.174],[73.22958,31.17328],[73.22538,31.17118],[73.21706,31.17643],[73.21691,31.17652],[73.212,31.17751],[73.20801,31.17831],[73.19821,31.1832],[73.1981,31.18321],[73.18896,31.18404],[73.18848,31.18408],[73.18848,31.17749],[73.18841,31.17748],[73.18841,31.17741],[73.18587,31.17685],[73.18451,31.17652],[73.17609,31.17652],[73.17605,31.17652],[73.17594,31.17652],[73.16953,31.17785],[73.16898,31.17796],[73.16878,31.17801],[73.16303,31.1792],[73.15145,31.17964],[73.15143,31.17969],[73.14921,31.18498],[73.14704,31.18422],[73.14148,31.18228],[73.14031,31.18187],[73.13319,31.18009],[73.12962,31.18454],[73.1225,31.18766],[73.11671,31.1832],[73.11313,31.18186],[73.11115,31.18112],[73.10958,31.18053],[73.10714,31.17882],[73.10513,31.17741],[73.10401,31.17648],[73.10259,31.17529],[73.10246,31.17519],[73.10199,31.17522],[73.09667,31.17563],[73.09421,31.17778],[73.09419,31.1778],[73.0931,31.17876],[73.08954,31.18187],[73.08643,31.18409],[73.08114,31.18674],[73.08108,31.18677],[73.08105,31.18674],[73.07792,31.18383],[73.07617,31.18221],[73.07485,31.18098],[73.06505,31.17964],[73.05748,31.17964],[73.05648,31.18001],[73.0553,31.18043],[73.05438,31.18077],[73.04768,31.1832],[73.04757,31.18331],[73.04743,31.18343],[73.04413,31.18648],[73.04189,31.18855],[73.04065,31.1892],[73.03908,31.19003],[73.03342,31.193],[73.02675,31.18588],[73.02491,31.18343],[73.02301,31.18089],[73.02007,31.17697],[73.01413,31.17524],[73.01384,31.17515],[73.00946,31.17387],[73.00938,31.17385],[73.00735,31.17332],[72.99913,31.17118],[72.99188,31.17118],[72.99069,31.17118],[72.98934,31.17118],[72.98341,31.17223],[72.98169,31.17249],[72.97647,31.17353],[72.97241,31.1743],[72.96748,31.17469],[72.96128,31.17519],[72.94658,31.17519],[72.93991,31.17416],[72.93532,31.17346],[72.92932,31.17249],[72.92511,31.1723],[72.92486,31.1723],[72.92315,31.17224],[72.91942,31.17207],[72.91096,31.16851],[72.90874,31.16753],[72.89982,31.16361],[72.89626,31.16361],[72.88468,31.16405],[72.87765,31.16405],[72.87488,31.15808],[72.87477,31.15784],[72.87345,31.15503],[72.8731,31.15426],[72.86834,31.15325],[72.86464,31.15247],[72.86262,31.15201],[72.86094,31.15162],[72.85895,31.15114],[72.85889,31.15112],[72.85883,31.15114],[72.85132,31.15289],[72.85122,31.15295],[72.8473,31.15466],[72.84695,31.15481],[72.84415,31.15604],[72.82812,31.16183],[72.8264,31.1633],[72.82188,31.16717],[72.81476,31.16762],[72.80496,31.1645],[72.7965,31.16138],[72.79508,31.16067],[72.79469,31.16048],[72.7867,31.15648],[72.78513,31.15606],[72.78511,31.15605]]],
+    'Tandlianwala': [[[73.22888,31.14612],[73.22449,31.14771],[73.21509,31.14447],[73.20227,31.14368],[73.19874,31.1433],[73.1975,31.14317],[73.19286,31.14268],[73.18604,31.13979],[73.18129,31.13778],[73.17998,31.13538],[73.17996,31.13535],[73.17731,31.1303],[73.1761,31.12812],[73.17598,31.12806],[73.1743,31.12716],[73.17152,31.12568],[73.16803,31.12596],[73.16392,31.1262],[73.16182,31.12396],[73.16164,31.12377],[73.1573,31.11909],[73.15217,31.11396],[73.15193,31.11372],[73.15189,31.11367],[73.15186,31.1137],[73.1514,31.11324],[73.1507,31.11249],[73.14429,31.10791],[73.1369,31.10571],[73.1355,31.09772],[73.1347,31.0965],[73.13287,31.09412],[73.13111,31.09149],[73.12653,31.08209],[73.12568,31.08011],[73.12567,31.08008],[73.1239,31.07593],[73.12383,31.07587],[73.12368,31.07575],[73.11805,31.07142],[73.11371,31.06751],[73.11369,31.0675],[73.11072,31.06653],[73.11065,31.0665],[73.10651,31.06488],[73.10231,31.06197],[73.09992,31.06031],[73.09991,31.0603],[73.09927,31.05994],[73.09851,31.05951],[73.09851,31.05943],[73.09809,31.05268],[73.08789,31.04907],[73.08832,31.04108],[73.08817,31.03523],[73.08808,31.0315],[73.08807,31.03132],[73.08789,31.02692],[73.08889,31.02415],[73.08923,31.0232],[73.08954,31.02243],[73.08375,31.01753],[73.07796,31.01531],[73.07417,31.0121],[73.0725,31.01069],[73.07217,31.01041],[73.06847,31.01014],[73.06806,31.0101],[73.06592,31.00989],[73.0617,31.01224],[73.06012,31.01312],[73.05982,31.0133],[73.0597,31.01337],[73.05963,31.0134],[73.05877,31.01389],[73.05872,31.01392],[73.05628,31.01489],[73.05353,31.02033],[73.05353,31.02692],[73.04592,31.0257],[73.0459,31.0257],[73.04608,31.02672],[73.04688,31.03131],[73.04613,31.0349],[73.04608,31.0351],[73.04547,31.03809],[73.04435,31.04241],[73.04413,31.04328],[73.04289,31.0429],[73.04233,31.04273],[73.0423,31.04273],[73.03891,31.04141],[73.03711,31.04071],[73.03351,31.03528],[73.02912,31.03308],[73.02548,31.03108],[73.02368,31.03009],[73.02008,31.02612],[73.01873,31.02054],[73.01868,31.02033],[73.01873,31.0199],[73.01884,31.01899],[73.01929,31.01532],[73.02039,31.0133],[73.02191,31.0105],[73.02332,31.00733],[73.02344,31.00699],[73.02407,31.00522],[73.02452,31.00417],[73.02448,31.00409],[73.02441,31.00397],[73.02008,30.99628],[73.02007,30.99616],[73.01946,30.99036],[73.01944,30.9902],[73.01929,30.98871],[73.01801,30.98618],[73.0156,30.98143],[73.01472,30.97968],[73.01471,30.97968],[73.01456,30.97978],[73.0119,30.98169],[73.01187,30.98172],[73.00952,30.98328],[73.00856,30.98352],[73.00144,30.98531],[72.99909,30.9859],[72.99896,30.98599],[72.99856,30.98627],[72.99812,30.98637],[72.99801,30.98639],[72.99707,30.98684],[72.9961,30.98731],[72.99578,30.98745],[72.99358,30.98845],[72.99351,30.98848],[72.9903,30.98993],[72.99023,30.98992],[72.9902,30.98991],[72.98149,30.98845],[72.98053,30.98828],[72.97553,30.98749],[72.97529,30.98746],[72.97431,30.98731],[72.97426,30.98726],[72.96851,30.98151],[72.9693,30.97492],[72.97113,30.97028],[72.9683,30.96538],[72.96707,30.9632],[72.96388,30.96018],[72.96304,30.95938],[72.95861,30.95518],[72.95838,30.95478],[72.95471,30.94812],[72.94892,30.9397],[72.9471,30.93598],[72.94629,30.93433],[72.94626,30.93426],[72.94549,30.93259],[72.94489,30.93128],[72.94482,30.93116],[72.9444,30.93041],[72.94011,30.9227],[72.93988,30.9223],[72.93848,30.9143],[72.93408,30.90491],[72.93048,30.90009],[72.92868,30.89645],[72.92712,30.89331],[72.92707,30.89325],[72.92548,30.89131],[72.92352,30.88892],[72.92347,30.88888],[72.92188,30.88788],[72.91837,30.88555],[72.9159,30.88391],[72.9148,30.88381],[72.91434,30.88377],[72.91266,30.88359],[72.90739,30.88303],[72.90565,30.88381],[72.90338,30.88482],[72.89604,30.891],[72.89492,30.89194],[72.89496,30.89204],[72.8949,30.89209],[72.8967,30.89641],[72.89673,30.89649],[72.89654,30.89723],[72.89593,30.90023],[72.89592,30.90026],[72.89551,30.90228],[72.89227,30.90668],[72.89181,30.90693],[72.88775,30.90915],[72.88568,30.91028],[72.88591,30.91251],[72.88593,30.91269],[72.88611,30.91824],[72.88695,30.92322],[72.88733,30.92545],[72.89004,30.9312],[72.89009,30.9313],[72.8905,30.9325],[72.89181,30.93917],[72.89191,30.9397],[72.89181,30.93977],[72.88797,30.94227],[72.88788,30.94232],[72.88772,30.94227],[72.88577,30.94156],[72.88568,30.94153],[72.88418,30.94082],[72.88349,30.94049],[72.88149,30.93919],[72.87889,30.93737],[72.87221,30.93648],[72.86775,30.93514],[72.86768,30.93512],[72.86623,30.93521],[72.85748,30.93573],[72.8537,30.93488],[72.85363,30.93486],[72.84992,30.9339],[72.84509,30.93213],[72.84113,30.93292],[72.83612,30.93653],[72.83485,30.93519],[72.83228,30.9325],[72.82708,30.9273],[72.82708,30.9273],[72.82648,30.9267],[72.82569,30.92249],[72.82565,30.92235],[72.82471,30.91828],[72.82013,30.91553],[72.81719,30.91305],[72.81389,30.91022],[72.81361,30.90924],[72.81333,30.90823],[72.81211,30.90375],[72.8116,30.90189],[72.81128,30.90051],[72.81009,30.88658],[72.80951,30.87988],[72.80329,30.87769],[72.80133,30.87628],[72.80116,30.87617],[72.79393,30.87152],[72.79116,30.86968],[72.78761,30.86591],[72.7876,30.86592],[72.78759,30.86591],[72.78668,30.86493],[72.78664,30.86489],[72.78649,30.86472],[72.78412,30.86212],[72.77551,30.85309],[72.77545,30.85315],[72.7754,30.8531],[72.77547,30.85304],[72.77537,30.85294],[72.77393,30.8515],[72.77382,30.85145],[72.76258,30.84561],[72.77158,30.83616],[72.77211,30.8356],[72.77066,30.82931],[72.76582,30.82303],[72.76521,30.81815],[72.76486,30.81529],[72.76931,30.80668],[72.77211,30.80126],[72.76776,30.79788],[72.76486,30.79159],[72.75967,30.79366],[72.7576,30.79449],[72.75228,30.79159],[72.75045,30.79067],[72.74067,30.78579],[72.74793,30.77998],[72.74732,30.77918],[72.74164,30.77176],[72.73702,30.76615],[72.73487,30.76354],[72.73584,30.75386],[72.7401,30.74411],[72.74261,30.73839],[72.7452,30.73821],[72.76242,30.73704],[72.76293,30.73701],[72.77114,30.73645],[72.78213,30.74123],[72.78215,30.74124],[72.78227,30.74129],[72.79083,30.74985],[72.79242,30.75145],[72.79595,30.75019],[72.80597,30.74661],[72.81433,30.74661],[72.81951,30.74661],[72.82921,30.74254],[72.83222,30.74128],[72.8345,30.74032],[72.8364,30.73558],[72.83934,30.72823],[72.83936,30.72795],[72.84021,30.71907],[72.84031,30.71807],[72.83363,30.71553],[72.83202,30.71492],[72.83015,30.71421],[72.8108,30.71276],[72.80654,30.71],[72.80258,30.70744],[72.79097,30.70018],[72.78275,30.69147],[72.78315,30.69009],[72.78662,30.67793],[72.78865,30.67802],[72.78872,30.67802],[72.79774,30.67842],[72.80762,30.68096],[72.81467,30.68277],[72.82531,30.69341],[72.82624,30.69239],[72.83015,30.68809],[72.83685,30.68222],[72.84174,30.67795],[72.84176,30.67793],[72.85046,30.68519],[72.85135,30.68559],[72.85207,30.68592],[72.8575,30.68839],[72.86642,30.69244],[72.87606,30.6882],[72.87851,30.68712],[72.88513,30.68354],[72.89012,30.68083],[72.8967,30.67708],[72.90028,30.67503],[72.90186,30.67478],[72.91237,30.6731],[72.92011,30.67745],[72.92011,30.69051],[72.92784,30.69438],[72.93268,30.69728],[72.93269,30.69745],[72.93291,30.70285],[72.93316,30.70889],[72.93427,30.71046],[72.93694,30.71428],[72.93753,30.71512],[72.93817,30.71604],[72.93932,30.71768],[72.93994,30.71856],[72.93757,30.72093],[72.93316,30.72533],[72.93172,30.72605],[72.92829,30.72777],[72.92156,30.73113],[72.92264,30.73362],[72.92639,30.74226],[72.93461,30.73984],[72.93496,30.73982],[72.94284,30.73935],[72.94299,30.74174],[72.94299,30.74187],[72.94303,30.74251],[72.94332,30.74709],[72.94355,30.74762],[72.94536,30.75186],[72.94696,30.75559],[72.94767,30.75725],[72.94818,30.75719],[72.95638,30.75628],[72.96151,30.75714],[72.96508,30.75773],[72.97137,30.76354],[72.97766,30.76934],[72.98298,30.76547],[72.98683,30.76393],[72.98885,30.76312],[72.99265,30.7616],[72.99459,30.77418],[73.00007,30.77296],[73.00329,30.77224],[73.00812,30.77224],[73.01635,30.77224],[73.01659,30.77243],[73.01808,30.77359],[73.0207,30.77563],[73.0228,30.7764],[73.02865,30.77856],[73.02989,30.77901],[73.04247,30.77805],[73.04247,30.77867],[73.04247,30.79062],[73.04406,30.79381],[73.04682,30.79933],[73.05882,30.80533],[73.0623,30.80706],[73.06277,30.80673],[73.06329,30.80636],[73.06907,30.80223],[73.07159,30.80088],[73.07632,30.79836],[73.07829,30.79764],[73.08093,30.79668],[73.08106,30.79664],[73.08333,30.79581],[73.08696,30.79449],[73.09432,30.80062],[73.09567,30.80175],[73.10099,30.81287],[73.10574,30.81015],[73.10776,30.809],[73.1155,30.80755],[73.12002,30.8124],[73.12227,30.8148],[73.12372,30.81618],[73.13041,30.82252],[73.13146,30.82351],[73.14113,30.83125],[73.14113,30.83261],[73.14113,30.83376],[73.14113,30.83899],[73.13678,30.84769],[73.13628,30.84868],[73.1358,30.84964],[73.13469,30.85187],[73.13436,30.85253],[73.13146,30.86317],[73.13678,30.86945],[73.14693,30.86607],[73.15806,30.86704],[73.16483,30.86027],[73.16483,30.85433],[73.16483,30.85344],[73.16483,30.85011],[73.16821,30.84237],[73.17005,30.84069],[73.17007,30.84067],[73.17402,30.83705],[73.17656,30.84013],[73.17925,30.84338],[73.18293,30.84784],[73.18321,30.84818],[73.18328,30.84849],[73.18478,30.85524],[73.18708,30.86559],[73.18707,30.86561],[73.18603,30.86916],[73.18397,30.87622],[73.18369,30.87719],[73.17595,30.88445],[73.17674,30.88838],[73.17788,30.89409],[73.17885,30.89896],[73.17944,30.89904],[73.18239,30.89945],[73.18884,30.90034],[73.18885,30.90035],[73.18938,30.90042],[73.19626,30.90138],[73.19588,30.90226],[73.19143,30.9125],[73.19385,30.92217],[73.20159,30.92266],[73.21223,30.91734],[73.20884,30.91202],[73.21109,30.90961],[73.21542,30.90496],[73.21555,30.90482],[73.21561,30.90476],[73.21564,30.90477],[73.22722,30.9096],[73.23072,30.91292],[73.23265,30.91476],[73.23689,30.91879],[73.24269,30.93039],[73.24322,30.93053],[73.25396,30.9334],[73.2572,30.93426],[73.26933,30.9351],[73.27123,30.93523],[73.27663,30.94526],[73.278,30.9478],[73.28295,30.94971],[73.28897,30.95202],[73.29058,30.95264],[73.29396,30.9657],[73.29841,30.96891],[73.30267,30.97199],[73.30746,30.97508],[73.32058,30.98353],[73.32443,30.98601],[73.3341,30.98408],[73.34571,30.98263],[73.35107,30.98496],[73.35139,30.98509],[73.35683,30.98746],[73.3621,30.99141],[73.37073,30.99788],[73.37231,30.99907],[73.37811,30.99569],[73.39311,30.99278],[73.39578,30.99444],[73.39796,30.99579],[73.40326,30.99907],[73.40181,31.00826],[73.39746,31.02084],[73.39774,31.02101],[73.39794,31.02113],[73.39593,31.02617],[73.39584,31.02637],[73.39371,31.0317],[73.39428,31.04026],[73.39559,31.04258],[73.3979,31.04669],[73.39946,31.0494],[73.39496,31.0567],[73.39504,31.05964],[73.39656,31.06649],[73.40113,31.06706],[73.40113,31.0671],[73.40188,31.07206],[73.40196,31.07259],[73.40284,31.07846],[73.40286,31.0785],[73.40312,31.07895],[73.40479,31.08175],[73.40756,31.0864],[73.4084,31.08791],[73.40854,31.08816],[73.41725,31.09632],[73.41766,31.09671],[73.42131,31.0996],[73.42133,31.09962],[73.42136,31.09964],[73.43223,31.10826],[73.43353,31.10929],[73.4342,31.10982],[73.43643,31.11102],[73.44236,31.11418],[73.44275,31.11438],[73.44389,31.12465],[73.44385,31.12469],[73.44386,31.1247],[73.43819,31.13037],[73.43854,31.13381],[73.43886,31.1367],[73.43936,31.1418],[73.43977,31.14248],[73.44288,31.1476],[73.42489,31.14891],[73.41732,31.14847],[73.4081,31.14347],[73.40663,31.14268],[73.40583,31.14261],[73.40085,31.14223],[73.39835,31.14001],[73.39684,31.13867],[73.38748,31.13689],[73.38305,31.13289],[73.38303,31.13288],[73.38259,31.1329],[73.37368,31.13332],[73.37303,31.13289],[73.37295,31.13284],[73.3697,31.13067],[73.36433,31.12709],[73.3621,31.12442],[73.36165,31.11996],[73.36655,31.11551],[73.37412,31.11017],[73.37591,31.10527],[73.38259,31.10126],[73.37812,31.09865],[73.37724,31.09814],[73.36878,31.09592],[73.36358,31.09031],[73.36299,31.08968],[73.36063,31.08673],[73.35943,31.08523],[73.35809,31.08122],[73.35553,31.07823],[73.35275,31.07498],[73.35069,31.074],[73.34659,31.07204],[73.3425,31.07008],[73.33493,31.06919],[73.33434,31.06911],[73.32514,31.06786],[73.32354,31.06852],[73.3227,31.06887],[73.31979,31.07008],[73.31222,31.07587],[73.30777,31.07454],[73.30633,31.07387],[73.30198,31.07187],[73.29307,31.07053],[73.29084,31.07409],[73.29084,31.0781],[73.28372,31.08166],[73.27671,31.08166],[73.27615,31.08166],[73.27125,31.08166],[73.2708,31.08701],[73.26709,31.08825],[73.26412,31.08923],[73.26412,31.09324],[73.25878,31.0977],[73.25725,31.10152],[73.25521,31.1066],[73.25454,31.10707],[73.24675,31.11239],[73.24274,31.11818],[73.24171,31.11951],[73.23651,31.1262],[73.23651,31.13555],[73.23428,31.14401],[73.23427,31.14402],[73.23238,31.1447],[73.22888,31.14612]]]
+  };
+}
